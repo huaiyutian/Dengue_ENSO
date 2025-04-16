@@ -1,0 +1,1785 @@
+---
+title: "MainCode_enso-dengue"
+date: "2024-10-09"
+output: pdf_document
+---
+
+```{python Preprocessing: country-level temperature/precipitation in each month between 1979-2019}
+import os
+import pandas as pd
+import geopandas as gpd
+import xarray as xr
+from rasterstats import zonal_stats
+import rasterio
+import rioxarray
+import numpy as np
+import warnings
+np.seterr(divide='ignore', invalid='ignore')
+#set your path
+os.chdir(r"ENSO-dengue_main20241014\ENSO-dengue_main20241014")
+def flip_lon_ll(da):
+    lat_da = da.coords["latitude"]
+    lon_da = da.coords["longitude"]
+    lon_180 = (lon_da.values + 180) % 360 - 180
+    da_180 = xr.DataArray(da.values,
+                          coords=[lat_da,lon_180],
+                          dims=["latitude","longitude"])
+    # flip dataarray so it goes from -180 to 180 (instead of 0-180, -180-0)
+    lon_min_neg = np.amin(lon_180[lon_180<0])
+    lon_max_neg = np.amax(lon_180[lon_180<0])
+    lon_min_pos = np.amin(lon_180[lon_180>=0])
+    lon_max_pos = np.amax(lon_180[lon_180>=0])
+    da_180_flip = xr.concat([da_180.loc[:,lon_min_neg:lon_max_neg],
+                             da_180.loc[:,lon_min_pos:lon_max_pos]],
+                            dim="longitude")
+    return(da_180_flip)
+def calculate_weighted_average(temp_data, pop_data, shp_data,area_threshold):
+    time_step_averages = []
+    for index, row in shp_data.iterrows():
+        country_geometry = row['geometry']
+        area = country_geometry.area
+        if area > area_threshold:
+            climate_country_mask = temp_data.rio.clip([country_geometry], all_touched=True)
+            pop_country_mask = pop_data.rio.clip([country_geometry], all_touched=True)
+            target_coords = {'latitude': climate_country_mask.latitude, 'longitude': climate_country_mask.longitude}
+            interpolated_pop = pop_country_mask.interp(coords=target_coords, method='linear') 
+            a = np.nansum(np.where(np.logical_or(np.isnan(climate_country_mask), climate_country_mask == 0), np.nan, climate_country_mask * interpolated_pop))
+            b = np.nansum(np.where(np.logical_or(np.isnan(interpolated_pop), interpolated_pop == 0), np.nan, interpolated_pop))
+            country_wgt_average = a / b
+            time_step_averages.append(country_wgt_average)
+        else:
+            centroid = country_geometry.centroid
+            nearest_temperature = temp_data.sel(latitude=centroid.y, longitude=centroid.x, method='nearest')
+            time_step_averages.append(nearest_temperature.values)           
+    return time_step_averages
+
+shp_path = "Data/0.Data/CountryShapefile/Country.shp" 
+shp_data = gpd.read_file(shp_path)
+climate_path = "Data/0.Data/ERA5/ERA5climate1979-2023.nc" #large file, not in file list
+climate = xr.open_dataset(climate_path)
+climate_data = climate['t2m'] #tp
+pop_path = "Data/0.Data/GPW/15ArcMinute/gpw_v4_population_count_rev11_15_min.nc"#large file, not in file list
+pop = xr.open_dataset(pop_path)
+time_ranges = {
+    1: {'start_date': '1979-01-01', 'end_date': '2002-12-01'},
+    2: {'start_date': '2003-01-01', 'end_date': '2007-12-01'},
+    3: {'start_date': '2008-01-01', 'end_date': '2012-12-01'},
+    4: {'start_date': '2013-01-01', 'end_date': '2017-12-01'},
+    5: {'start_date': '2018-01-01', 'end_date': '2019-12-01'},
+}
+area_threshold = 0.062 
+time_step_averages = []
+for i in range(1, 6):
+    start_date = time_ranges[i]['start_date']
+    end_date = time_ranges[i]['end_date']
+
+    t2m_data = climate_data.sel(time=slice(start_date, end_date))
+    t2m_data['time'] = t2m_data['time'].dt.strftime('%Y%m')
+    current_pop = pop['Population Count, v4.11 (2000, 2005, 2010, 2015, 2020): 15 arc-minutes'].copy()
+    pop_data = current_pop.isel(raster = i-1) 
+    pop_data.rio.write_crs("WGS84", inplace=True)
+ 
+    for time_point in range(len(t2m_data['time'])):  
+        temp_data = t2m_data.isel(time=time_point, expver=0)  
+        temp_data = flip_lon_ll(temp_data)
+        temp_data.rio.write_crs("WGS84", inplace=True)
+        temp_data = temp_data.fillna(0)
+        averages = []
+        time_step_averages.append(calculate_weighted_average(temp_data, pop_data, shp_data, area_threshold))
+       
+date_range = pd.date_range(start='1979-01-01', end='2019-12-01', freq='MS')
+date_column = date_range.strftime('%Y/%m')
+year_column = date_range.year
+month_column = date_range.month
+df = pd.DataFrame(time_step_averages, columns=shp_data['ADMIN'])
+df['year'] = year_column
+df['month'] = month_column
+cols = ['year', 'month'] + [col for col in df.columns if col not in ['year', 'month']]
+df = df[cols]
+
+excel_output_path = "Data/2.climate_country_wgt/countrytemperature_popwgt_monthly.xlsx"
+#excel_output_path = "Data/CountryPrecip_wgt/countryprecipitation_popwgt_monthly.xlsx" 
+df.to_excel(excel_output_path,index = False)
+print('finished')
+```
+
+```{python Preprocessing: 3-month running mean of country-level climate}
+import pandas as pd
+
+input_excel_path = 'Data/2.climate_country_wgt/countrytemperature_popwgt_monthly.xlsx' #countryprecipitation_popwgt_monthly.xlsx
+df = pd.read_excel(input_excel_path)
+climate = 'Temperature' #'Precipitation' 
+countries = df.columns[2:]
+
+DJF_result_data = []
+JFM_result_data = []
+FMA_result_data = []
+MAM_result_data = []
+
+for country in countries:
+    for year in range(1979, 2020):
+        DJF_Data_subset = df[((df['year'] == year-1) & (df['month'].between(12, 12))) | ((df['year'] == year ) & df['month'].between(1, 2))]
+        DJF_average_value = DJF_Data_subset[country].mean()
+        DJF_result_data.append({'year': year, 'country': country, climate: DJF_average_value})
+
+        JFM_data_subset = df[(df['year'] == year) & (df['month'].between(1, 3))]
+        JFM_average_value = JFM_data_subset[country].mean()
+        JFM_result_data.append({'year': year, 'country': country, climate: JFM_average_value})
+
+        FMA_data_subset = df[(df['year'] == year) & (df['month'].between(2, 4))]
+        FMA_average_value = FMA_data_subset[country].mean()
+        FMA_result_data.append({'year': year, 'country': country, climate: FMA_average_value})
+
+        MAM_data_subset = df[(df['year'] == year) & (df['month'].between(3, 5))]
+        MAM_average_value = MAM_data_subset[country].mean()
+        MAM_result_data.append({'year': year, 'country': country, climate: MAM_average_value})       
+
+DJF_result_df = pd.DataFrame(DJF_result_data )
+JFM_result_df = pd.DataFrame(JFM_result_data)
+FMA_result_df = pd.DataFrame(FMA_result_data)
+MAM_result_df = pd.DataFrame(MAM_result_data)
+
+DJF_path = 'Data/2.climate_country_wgt/country_temp_DJF.xlsx'#CountryPrecip_wgt/country_prec_DJF.xlsx'
+DJF_result_df.to_excel(DJF_path, index=False)
+
+JFM_path = 'Data/2.climate_country_wgt/country_temp_JFM.xlsx'#CountryPrecip_wgt/country_prec_JFM.xlsx'
+JFM_result_df.to_excel(JFM_path, index=False)
+
+FMA_path = 'Data/2.climate_country_wgt/country_temp_FMA.xlsx'#CountryPrecip_wgt/country_prec_FMA.xlsx'
+FMA_result_df.to_excel(FMA_path, index=False)
+
+MAM_path = 'Data/2.climate_country_wgt/country_temp_MAM.xlsx'#CountryPrecip_wgt/country_prec_MAM.xlsx'
+MAM_result_df.to_excel(MAM_path, index=False)
+
+print('finished')
+
+```
+
+```{python max of 3-month running of teleconnections}
+import pandas as pd
+import numpy as np
+from scipy import signal, stats
+from statsmodels.formula.api import ols as reg
+
+def detrend_standardize(data):
+    detrended_data = signal.detrend(data,type ='linear')
+    de_sta_result = stats.zscore(detrended_data)
+    return de_sta_result
+
+def partial_correlation(x,y,z):
+    df = pd.DataFrame({"x":x,"y":y,"z":z})
+    x_z_resids = reg("x~z",data=df).fit().resid.values
+    y_z_resids = reg("y~z",data=df).fit().resid.values
+    corr, p = stats.pearsonr(x_z_resids,y_z_resids)
+    return corr,p
+
+#calculate detrended_standardized DJF nino3.4
+nino_excel_path = "Data/1.ENSO_index/ENSO indices_monthly_1979-2023.xlsx"
+df_nino = pd.read_excel(nino_excel_path)
+DJF_nino = []
+for year in range(1980, 2020):
+        DJF_Data_subset = df_nino[((df_nino['year'] == year-1) & (df_nino['month'].between(12, 12))) |
+                                  ((df_nino['year'] == year ) & df_nino['month'].between(1, 2))]
+        DJF_average_value = DJF_Data_subset['NINO3.4'].mean()
+        DJF_nino.append(DJF_average_value)
+de_sta_djf_nino = detrend_standardize(DJF_nino)
+
+#partial correlation
+max_corr_t_values = {}
+max_corr_p_values = {}
+
+seasons = ['DJF','JFM','FMA','MAM']
+for season in seasons:
+    t_excel_path = f"Data/2.climate_country_wgt/country_temp_{season}.xlsx"
+    p_excel_path = f"Data/2.climate_country_wgt/country_prec_{season}.xlsx"
+    df_t = pd.read_excel(t_excel_path)
+    df_p = pd.read_excel(p_excel_path)
+    
+    countries = df_t['country'].unique()
+    for country in countries:
+        country_temp = df_t[(df_t['country'] == country) & (df_t['year'].between(1980,2019))]['Temperature'].values
+        country_prec = df_p[(df_p['country'] == country) & (df_p['year'].between(1980,2019))]['Precipitation'].values
+
+        de_sta_temp = detrend_standardize(country_temp)
+        de_sta_prec = detrend_standardize(country_prec)
+        
+        temp_corr, temp_p = partial_correlation(de_sta_temp, de_sta_djf_nino, de_sta_prec)
+        prec_corr, prec_p = partial_correlation(de_sta_prec, de_sta_djf_nino, de_sta_temp)
+        
+        if country not in max_corr_t_values or abs(temp_corr) > abs(max_corr_t_values[country]['max_t_corr']):
+            max_corr_t_values[country] = {'max_t_corr': temp_corr, 't_season': season}
+        if country not in max_corr_p_values or abs(prec_corr) > abs(max_corr_p_values[country]['max_p_corr']):
+            max_corr_p_values[country] = {'max_p_corr': prec_corr, 'p_season': season}
+
+tresult_df = pd.DataFrame(columns=['country', 'season', 'tau_t'])
+presult_df = pd.DataFrame(columns=['country', 'season', 'tau_p'])
+
+for country in max_corr_t_values:
+    temp_df = pd.DataFrame([{'country': country, 'season': max_corr_t_values[country]['t_season'],
+                             'tau_t': max_corr_t_values[country]['max_t_corr']}])
+    tresult_df = pd.concat([tresult_df, temp_df], ignore_index=True)
+    
+for country in max_corr_p_values:
+    temp_df = pd.DataFrame([{'country': country, 'season': max_corr_p_values[country]['p_season'],
+                             'tau_p': max_corr_p_values[country]['max_p_corr']}])
+    presult_df = pd.concat([presult_df, temp_df], ignore_index=True)
+
+tresult_df.to_excel('Data/4.Teleconnections/tau_t_max_3monthrunning.xlsx', index=False)
+presult_df.to_excel('Data/4.Teleconnections/tau_p_max_3monthrunning.xlsx', index=False)
+
+print("Results saved.")
+```
+
+```{r Figure 1b}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+#set your path
+setwd("/ENSO-dengue_main20241014/ENSO-dengue_main20241014")
+
+data <- read.csv('Data/3.dengue_case/distribution_la_el.csv')
+data <- data %>%
+  group_by(dengue_total) %>%
+  mutate(de_incidence = scale(de_incidence)) %>%
+  ungroup()
+
+data$category <- cut(data$NINO34_lag0, breaks = c(-Inf, -0.5, 0.5, Inf), labels = c("LaNINA", "Neutral", "ELNINO"))
+
+
+total_cases <- data %>%
+  group_by(dengue_total) %>%
+  summarise(total_case = sum(case, na.rm = TRUE)) %>%
+  ungroup()
+
+average_incidence <- data %>%
+  filter(category != "Neutral") %>%
+  group_by(dengue_total, category) %>%
+  summarise(mean_incidence = mean(de_incidence, na.rm = TRUE),
+            se_incidence = sd(de_incidence) / sqrt(n())) %>%
+  ungroup()
+
+wide_data <- average_incidence %>%
+  pivot_wider(names_from = category, values_from = c(mean_incidence, se_incidence)) %>%
+  filter(!is.na(mean_incidence_ELNINO) & !is.na(mean_incidence_LaNINA))
+
+wide_data <- wide_data %>%
+  left_join(total_cases, by = "dengue_total")
+
+wide_data <- wide_data %>%
+  mutate(point_size_norm = (total_case - min(total_case)) / (max(total_case) - min(total_case)))
+
+#plot
+ggplot(wide_data, aes(x = mean_incidence_LaNINA, y = mean_incidence_ELNINO)) +
+    geom_errorbar(aes(ymin = mean_incidence_ELNINO - se_incidence_ELNINO, ymax = mean_incidence_ELNINO + se_incidence_ELNINO),
+                  width = 0, color = "#A6A6A6", alpha = 0.6, linetype = "solid") +
+    geom_errorbarh(aes(xmin = mean_incidence_LaNINA - se_incidence_LaNINA, xmax = mean_incidence_LaNINA + se_incidence_LaNINA),
+                   height = 0, color = "#A6A6A6", alpha = 0.6, linetype = "solid") +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "black") +
+    geom_point(aes(size = total_case), color = "purple") +
+    scale_size_continuous(range = c(2, 10)) +
+    labs(title = "Average Incidence Rates: ELNINO vs. LaNINA by Country",
+         x = "LaNINA Average Incidence",
+         y = "ELNINO Average Incidence",
+         size = "Total Cases",
+         alpha = "Standardized Cases") +
+    theme_classic() +
+    theme(panel.grid = element_blank(), 
+          panel.border = element_rect(color = "black", fill = NA),
+          axis.line = element_line(color = "black")) +
+    guides(size = guide_legend(override.aes = list(size = c(2,4,8,10))))
+
+data_high <- average_incidence %>% filter(category == "ELNINO")
+data_low <- average_incidence %>% filter(category == "LaNINA")
+
+# Mann-Whitney U test
+wilcox_test_result <- wilcox.test(data_high$mean_incidence, data_low$mean_incidence)
+print(wilcox_test_result)
+```
+
+```{r Figure 1c}
+#set your path
+setwd("/ENSO-dengue_main20241014/ENSO-dengue_main20241014")
+
+pdf("Figure/Fig1c_heatmap.pdf", width =10, height = 20) #CMIP
+library(gplots)  
+library(RColorBrewer) 
+
+data <- read.csv("Data/4.Teleconnections/Fig1c_Corr_allnino_teleconnection.csv", row.names = 1)
+colors <- colorRampPalette(c("#6D9EC1", "white", "#E46726"))(101)
+heatmap.2(as.matrix(data), 
+          col = colors,    
+          scale = "none", 
+          dendrogram = "none", 
+          Rowv = FALSE, 
+          Colv = FALSE,    
+          trace = "none",  
+          key = FALSE,     
+          keysize = 1.0, 
+          xlab = "",  
+          ylab = "",    
+          margins = c(7, 20), 
+          cexCol = 1.5,
+          cexRow = 1.5,
+          cellnote = ifelse(abs(data) > 0.304, "*", ""), 
+          notecol = "black",
+          notecex = 1.5) 
+
+dev.off()
+```
+
+
+```{r Figure 2ab}
+library(ggplot2)
+library(lfe)
+library(plm)
+#####plot Figure 2
+#set your path
+setwd("ENSO-dengue_main20241014/ENSO-dengue_main20241014/")
+#####plot2a.temp####
+exp_interact_temp_coefs_dist<-read.csv("Data/6.Regression_coefficient/ENSO_teleconnection-interaction_temp_coefs_bootstrap-dist_lag2NINO34.csv")
+nlag<-2
+nboot <- 1000
+corrs <- seq(from=-0.34, to=0.92, by=0.01)###tele_temp[min,max]
+corr_means_w <- matrix(0, nrow=length(corrs),1)
+corr_upper_w <- matrix(0, nrow=length(corrs),1)
+corr_lower_w <- matrix(0, nrow=length(corrs),1)
+corr_indiv_w <- matrix(0, nrow=nboot, ncol=nlag+1)
+for (c in corrs) {
+  for (l in 0:nlag) {
+    int_coef_w <- exp_interact_temp_coefs_dist[, paste0("coef_lag", l)]
+    corr_indiv_w[, l+1] <- (int_coef_w * c)
+  }
+  cumulative_w <- rowSums(corr_indiv_w)
+  corr_means_w[which(corrs == c), ] <- mean(cumulative_w)
+  corr_upper_w[which(corrs == c), ] <- quantile(cumulative_w, probs = 0.975)
+  corr_lower_w[which(corrs == c), ] <- quantile(cumulative_w, probs = 0.025)
+}
+#lag 0
+corr_means_w0 <- matrix(0, nrow=length(corrs),1)
+corr_upper_w0 <- matrix(0, nrow=length(corrs),1)
+corr_lower_w0 <- matrix(0, nrow=length(corrs),1)
+corr_indiv_w0 <- matrix(0, nrow=nboot, ncol=1)
+for (c in corrs) {
+  corr_indiv_w0[, 1] <- (exp_interact_temp_coefs_dist$coef_lag0 * c)
+  corr_means_w0[which(corrs == c), ] <- mean(corr_indiv_w0)
+  corr_upper_w0[which(corrs == c), ] <- quantile(corr_indiv_w0, probs = 0.975)
+  corr_lower_w0[which(corrs == c), ] <- quantile(corr_indiv_w0, probs = 0.025)
+}
+# set dataframe
+df <- data.frame(x = seq(from=-0.34, to=0.92, by=0.01))##temp_tele
+my_theme <- theme(
+  panel.background = element_rect(fill = "white"),  
+  panel.border = element_rect(color = "black", fill = NA),  
+  legend.title = element_blank(),  
+  plot.title = element_text(hjust = 0.5),  
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(), 
+  axis.text = element_text(size = 12),  
+  axis.ticks = element_line(size = 0.5),  
+  axis.line = element_line(linewidth  = 0.5)  
+)
+
+ggplot(df, aes(x = x)) +
+  geom_ribbon(aes(ymin = corr_lower_w, ymax = corr_upper_w), fill = "gray", alpha =0.7) +
+  geom_ribbon(aes(ymin = corr_lower_w0, ymax = corr_upper_w0), fill = "gray", alpha = 0.7) +
+  geom_line(aes(y = corr_means_w, linetype = "lag0"), size = 1.5) +
+  geom_line(aes(y = corr_means_w0, linetype = "lag2"), size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "solid") +
+  xlim(-0.34, 0.92) +
+  labs(x = "NINO3.4 teleconnection with temperature", y = "Cumulative effects via temperature") +
+  scale_linetype_manual(values = c("lag0" = "dashed", "lag2" = "solid"), labels = c("2 lags", "0 lags")) +
+  my_theme +
+  scale_y_continuous(breaks = seq(-2.0, 5.0, 1.0))
+
+#####plot2b.prec####
+exp_interact_prec_coefs_dist<-read.csv("Data/6.Regression_coefficient/ENSO_teleconnection-interaction_prec_coefs_bootstrap-dist_lag2NINO34.csv")
+corrs <- seq(from=-0.86, to=0.61, by=0.01)
+corr_means_w <- matrix(0, nrow=length(corrs),1)
+corr_upper_w <- matrix(0, nrow=length(corrs),1)
+corr_lower_w <- matrix(0, nrow=length(corrs),1)
+corr_indiv_w <- matrix(0, nrow=nboot, ncol=nlag+1)
+for (c in corrs) {
+  for (l in 0:nlag) {
+    int_coef_w <- exp_interact_prec_coefs_dist[, paste0("coef_lag", l)]
+    corr_indiv_w[, l+1] <- (int_coef_w * c)
+  }
+  cumulative_w <- rowSums(corr_indiv_w)
+  corr_means_w[which(corrs == c), ] <- mean(cumulative_w)
+  corr_upper_w[which(corrs == c), ] <- quantile(cumulative_w, probs = 0.975)
+  corr_lower_w[which(corrs == c), ] <- quantile(cumulative_w, probs = 0.025)
+}
+
+corr_means_w0 <- matrix(0, nrow=length(corrs),1)
+corr_upper_w0 <- matrix(0, nrow=length(corrs),1)
+corr_lower_w0 <- matrix(0, nrow=length(corrs),1)
+corr_indiv_w0 <- matrix(0, nrow=nboot, ncol=1)
+for (c in corrs) {
+  corr_indiv_w0[, 1] <-  (exp_interact_prec_coefs_dist$coef_lag0 * c)
+  corr_means_w0[which(corrs == c), ] <- mean(corr_indiv_w0)
+  corr_upper_w0[which(corrs == c), ] <- quantile(corr_indiv_w0, probs = 0.975)
+  corr_lower_w0[which(corrs == c), ] <- quantile(corr_indiv_w0, probs = 0.025)
+}
+
+df <- data.frame(x = seq(from=-0.86, to=0.61, by=0.01))##temp_tele
+
+ggplot(df, aes(x = x)) +
+  geom_ribbon(aes(ymin = corr_lower_w, ymax = corr_upper_w), fill = "gray", alpha =0.7) +
+  geom_ribbon(aes(ymin = corr_lower_w0, ymax = corr_upper_w0), fill = "gray", alpha = 0.7) +
+  geom_line(aes(y = corr_means_w, linetype = "lag0"), size = 1.5) +
+  geom_line(aes(y = corr_means_w0, linetype = "lag1"), size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "solid") +
+  xlim(-0.86, 0.61) +
+  labs(x = "NINO3.4 teleconnection with precipitation", y = "Cumulative effects via precipitation") +
+  scale_linetype_manual(values = c("lag0" = "dashed", "lag1" = "solid"), labels = c("lag2", "lag0")) +
+  my_theme +
+  scale_y_continuous(breaks = seq(-10, 3, 0.5))+ 
+  scale_x_continuous(breaks = seq(-1, 1, 0.25))
+
+```
+
+```{r Figure 2c}
+library(readxl)
+library(ggplot2)
+library(dplyr)
+library(ggpubr)
+library(RColorBrewer) 
+#####figure 2c####
+#set your path
+setwd("ENSO-dengue_main20241014/ENSO-dengue_main20241014/")
+temp_df <- read_excel("Data/6.Regression_coefficient/fig_2c_2d.xlsx", sheet = "2c_temp")
+precip_df <- read_excel("Data/6.Regression_coefficient/fig_2c_2d.xlsx", sheet = "2c_prec")
+## plot mean and errorbar
+means_temp <- colMeans(temp_df[, -1]) 
+means_precip1 <- colMeans(precip_df[1:56, -1]) 
+means_precip2 <- colMeans(precip_df[57:117, -1])
+means_precip3 <- colMeans(precip_df[118:148, -1])
+#set dataframe
+data <- data.frame(
+  year = 0:2,
+  group = rep(c("temp", "tau≤-0.304","-0.304<tau<-0.304","tau≥0.304"), each = nlag+1),
+  avg = c(means_temp[1:3],means_precip1[1:3],means_precip2[1:3],means_precip3[1:3]),
+  upper = c(means_temp[4:6],means_precip1[4:6],means_precip2[4:6],means_precip3[4:6]),
+  lower = c(means_temp[7:9],means_precip1[7:9],means_precip2[7:9],means_precip3[7:9])
+)
+
+ggplot(data, aes(x = year, y = avg, group = group, color = group)) +
+  geom_point(size = 3) +    
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.2, linetype = "dotted") +
+  labs(x = "Lagged years", y = "Change in number of cases per 1 in ENSO", title = "Dengue changes due to ENSO") +
+  scale_color_manual(values = c("temp" = "#C82423", "tau≤-0.304" = "#2878B5", "-0.304<tau<-0.304" = "#A5B6C5", "tau≥0.304" = "#9AC9DB")) +
+  geom_hline(yintercept = 0, linetype = "solid") +
+  theme_minimal() + 
+  theme(plot.title = element_text(hjust = 0.5), 
+        panel.border = element_rect(color = "black", fill = NA),
+        panel.grid.major = element_blank(),          
+        panel.grid.minor = element_blank()) +
+  guides(color = guide_legend(override.aes = list(size = 4)))+
+  scale_y_continuous(breaks = seq(-10, 3, 0.25))
+```
+
+```{r Figure 2d}
+df <- read_excel("Data/6.Regression_coefficient/fig_2c_2d.xlsx", sheet = "trade-off_synergy")
+#pdf("./Figure/Figure 2d.pdf", width = 3.5, height = 3.8)
+ggplot(df, aes(x = effect_temp_past, y = effect_prec_past)) +
+  geom_point(color = "grey50", size = 3, alpha = 0.8)+
+  geom_hline(yintercept = 0,color = "grey") + 
+  geom_vline(xintercept = 0, color = "grey") + 
+  labs(
+    x = "Dengue relative risk via temperature",
+    y = "Dengue relative risk via precipitation",
+  ) +
+  theme(
+    strip.text = element_text(size = 8, face = "bold"),
+    axis.title = element_text(size = 8),
+    legend.position = "bottom",
+    panel.background = element_blank(),
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, size = 1),
+    axis.ticks = element_line(color = "black")
+  )
+```
+
+
+```{python Figure 3b}
+import matplotlib.pyplot as plt
+from matplotlib import rcParams
+import matplotlib.gridspec as gridspec
+from scipy import stats 
+import numpy as np
+import pandas as pd   
+from matplotlib.colors import LinearSegmentedColormap
+
+def calculate_country_stats(group, coefs_temp, coefs_prec):
+    country_temp_stats = []
+    country_prec_stats = []
+
+    for index, row in group.iterrows():
+        temp_effect = row['tau_temp'] * coefs_temp
+        prec_effect = row['tau_prec'] * coefs_prec
+
+        temp_stats = {
+            'mean': np.mean(temp_effect),
+            'lower_95': np.quantile(temp_effect, 0.025),
+            'upper_95': np.quantile(temp_effect, 0.975)
+        }
+        prec_stats = {
+            'mean': np.mean(prec_effect),
+            'lower_95': np.quantile(prec_effect, 0.025),
+            'upper_95': np.quantile(prec_effect, 0.975)
+        }
+
+        country_temp_stats.append(temp_stats)
+        country_prec_stats.append(prec_stats)
+
+    return country_temp_stats, country_prec_stats
+
+def calculate_region_stats(country_stats):
+    means = [stats['mean'] for stats in country_stats]
+    lower_95s = [stats['lower_95'] for stats in country_stats]
+    upper_95s = [stats['upper_95'] for stats in country_stats]
+
+    region_stats = {
+        'mean': np.mean(means),
+        'lower_95': np.mean(lower_95s),
+        'upper_95': np.mean(upper_95s)
+    }
+
+    return region_stats
+
+data = pd.read_csv("Data/6.Regression_coefficient/ENSO_country_rank.csv")
+coefs_temp = pd.read_csv("Data/6.Regression_coefficient/ENSO_teleconnection-interaction_temp_coefs_bootstrap-dist_lag2NINO34.csv")
+coefs_prec = pd.read_csv("Data/6.Regression_coefficient/ENSO_teleconnection-interaction_prec_coefs_bootstrap-dist_lag2NINO34.csv")
+
+coefs_cumu_temp = coefs_temp['CUMU'].values
+coefs_cumu_prec = coefs_prec['CUMU'].values
+
+regions_of_interest = [
+    'Northern America', 'Southern Asia', 'Melanesia',
+    'South America', 'Caribbean and Central America', 'South-Eastern Asia'
+]
+temp_categories = ['low', 'medium', 'high']
+prec_categories = ['low', 'medium', 'high']
+
+region_stats = {}
+for name, group in data.groupby('region'):
+    if name in regions_of_interest:
+        country_temp_stats, country_prec_stats = calculate_country_stats(group, coefs_cumu_temp, coefs_cumu_prec)
+        
+        region_temp_stats = calculate_region_stats(country_temp_stats)
+        region_prec_stats = calculate_region_stats(country_prec_stats)
+
+        region_stats[name] = {
+            'effect_temp_mean': region_temp_stats['mean'],
+            'effect_temp_lower_95': region_temp_stats['lower_95'],
+            'effect_temp_upper_95': region_temp_stats['upper_95'],
+            'effect_prec_mean': region_prec_stats['mean'],
+            'effect_prec_lower_95': region_prec_stats['lower_95'],
+            'effect_prec_upper_95': region_prec_stats['upper_95']
+        }
+
+temperature_stats = {}
+for name, group in data.groupby('temp'):
+    if name in temp_categories:
+        country_temp_stats, country_prec_stats = calculate_country_stats(group, coefs_cumu_temp, coefs_cumu_prec)
+        
+        temperature_temp_stats = calculate_region_stats(country_temp_stats)
+        temperature_prec_stats = calculate_region_stats(country_prec_stats)
+
+        temperature_stats[name] = {
+            'effect_temp_mean': temperature_temp_stats['mean'],
+            'effect_temp_lower_95': temperature_temp_stats['lower_95'],
+            'effect_temp_upper_95': temperature_temp_stats['upper_95'],
+            'effect_prec_mean': temperature_prec_stats['mean'],
+            'effect_prec_lower_95': temperature_prec_stats['lower_95'],
+            'effect_prec_upper_95': temperature_prec_stats['upper_95']
+        }
+
+precipitation_stats = {}
+for name, group in data.groupby('prec'):
+    if name in prec_categories:
+        country_temp_stats, country_prec_stats = calculate_country_stats(group, coefs_cumu_temp, coefs_cumu_prec)
+        
+        precipitation_temp_stats = calculate_region_stats(country_temp_stats)
+        precipitation_prec_stats = calculate_region_stats(country_prec_stats)
+
+        precipitation_stats[name] = {
+            'effect_temp_mean': precipitation_temp_stats['mean'],
+            'effect_temp_lower_95': precipitation_temp_stats['lower_95'],
+            'effect_temp_upper_95':precipitation_temp_stats['upper_95'],
+            'effect_prec_mean': precipitation_prec_stats['mean'],
+            'effect_prec_lower_95': precipitation_prec_stats['lower_95'],
+            'effect_prec_upper_95': precipitation_prec_stats['upper_95']
+        }
+########################plot##########################
+fig = plt.figure(figsize=(12, 8))
+rcParams['font.family'] = 'Arial'
+rcParams["font.size"] = 9.0
+rcParams["axes.linewidth"] = 1.3
+rcParams['xtick.major.size'] = 8
+rcParams['xtick.major.width'] = 1.3
+rcParams['ytick.major.size'] = 8
+rcParams['ytick.major.width'] = 1.3
+rcParams["mathtext.default"] = "regular"
+rcParams['pdf.use14corefonts'] = True
+
+colors_negative = ['#3783BB', 'white']
+colors_positive = ['white', '#C94741']
+cmap_negative = LinearSegmentedColormap.from_list('negative', colors_negative, N=256)
+cmap_positive = LinearSegmentedColormap.from_list('positive', colors_positive, N=256)
+
+def get_color(value):
+    if value < 0:
+        norm_value = (value + 1) / 1
+        return cmap_negative(norm_value)
+    else:
+        norm_value = value / 3
+        return cmap_positive(norm_value)
+
+gs = gridspec.GridSpec(2, 3, wspace=0.05, hspace=0.1)
+
+# Region Temperature
+ax1 = plt.subplot(gs[0, 0])
+ax1.axhline(0, color="black", alpha=0.5, linewidth=1.3, linestyle="--", dashes=(7, 3))
+for i, region in enumerate(regions_of_interest):
+    stats = region_stats[region]
+    ax1.errorbar(
+        x=i + 1,
+        y=stats['effect_temp_mean'],
+        yerr=[[stats['effect_temp_mean'] - stats['effect_temp_lower_95']], [stats['effect_temp_upper_95'] - stats['effect_temp_mean']]],
+        fmt='o',
+        color=get_color(stats['effect_temp_mean']),
+        markersize = 7,
+        markeredgecolor='black',
+        markerfacecolor='black',
+        capsize=5,
+        elinewidth=6
+    )
+ax1.set_ylim(-1.25,4.8)
+ax1.set_ylabel('Cumulative Effects via Temperature')
+ax1.set_xticks(np.arange(1, len(regions_of_interest) + 1))
+ax1.set_xticklabels('')
+
+# Temp Temperature
+ax2 = plt.subplot(gs[0, 1])
+ax2.axhline(0, color="black", alpha=0.5, linewidth=1.3, linestyle="--", dashes=(7, 3))
+for i, temp in enumerate(temp_categories):
+    stats = temperature_stats[temp]
+    ax2.errorbar(
+        x=i + 1,
+        y=stats['effect_temp_mean'],
+        yerr=[[stats['effect_temp_mean'] - stats['effect_temp_lower_95']], [stats['effect_temp_upper_95'] - stats['effect_temp_mean']]],
+        fmt='o',
+        color=get_color(stats['effect_temp_mean']),
+        markersize = 7,
+        markeredgecolor='black',
+        markerfacecolor='black',
+        capsize=5,
+        elinewidth=6
+    )
+ax2.set_ylim(-1.25,4.8)
+ax2.set_ylabel('')
+ax2.set_yticklabels('')
+ax2.yaxis.set_ticks([])
+ax2.set_xticks(np.arange(1, len(temp_categories) + 1))
+ax2.set_xticklabels('')
+
+# Prec Temperature
+ax3 = plt.subplot(gs[0, 2])
+ax3.axhline(0, color="black", alpha=0.5, linewidth=1.3, linestyle="--", dashes=(7, 3))
+for i, prec in enumerate(prec_categories):
+    stats = precipitation_stats[prec]
+    ax3.errorbar(
+        x=i + 1,
+        y=stats['effect_temp_mean'],
+        yerr=[[stats['effect_temp_mean'] - stats['effect_temp_lower_95']], [stats['effect_temp_upper_95'] - stats['effect_temp_mean']]],
+        fmt='o',
+        color=get_color(stats['effect_temp_mean']),
+        markersize = 7,
+        markeredgecolor='black',
+        markerfacecolor='black',
+        capsize=5,
+        elinewidth=6
+    )
+ax3.set_ylim(-1.25,4.8)
+ax3.set_ylabel('')
+ax3.set_yticklabels('')
+ax3.yaxis.set_ticks([])
+ax3.set_xticks(np.arange(1, len(prec_categories) + 1))
+ax3.set_xticklabels('')
+
+# Region Precipitation
+ax4 = plt.subplot(gs[1, 0])
+ax4.axhline(0, color="black", alpha=0.5, linewidth=1.3, linestyle="--", dashes=(7, 3))
+for i, region in enumerate(regions_of_interest):
+    stats = region_stats[region]
+    ax4.errorbar(
+        x=i + 1,
+        y=stats['effect_prec_mean'],
+        yerr=[[stats['effect_prec_mean'] - stats['effect_prec_lower_95']], [stats['effect_prec_upper_95'] - stats['effect_prec_mean']]],
+        fmt='o',
+        color=get_color(stats['effect_prec_mean']),
+        markersize = 7,
+        markeredgecolor='black',
+        markerfacecolor='white',
+        capsize=5,
+        elinewidth=6
+    )
+ax4.set_ylim(-1.25,4.8)
+ax4.set_ylabel('Cumulative Effects via Precipitation')
+ax4.set_xticks(np.arange(1, len(regions_of_interest) + 1))
+ax4.set_xticklabels(regions_of_interest, rotation=45, ha="right")
+
+# Temp Precipitation
+ax5 = plt.subplot(gs[1, 1])
+ax5.axhline(0, color="black", alpha=0.5, linewidth=1.3, linestyle="--", dashes=(7, 3))
+for i, temp in enumerate(temp_categories):
+    stats = temperature_stats[temp]
+    ax5.errorbar(
+        x=i + 1,
+        y=stats['effect_prec_mean'],
+        yerr=[[stats['effect_prec_mean'] - stats['effect_prec_lower_95']], [stats['effect_prec_upper_95'] - stats['effect_prec_mean']]],
+        fmt='o',
+        color=get_color(stats['effect_prec_mean']),
+        markersize = 7,
+        markeredgecolor='black',
+        markerfacecolor='white',
+        capsize=5,
+        elinewidth=6
+    )
+ax5.set_ylim(-1.25,4.8)
+ax5.set_ylabel('')
+ax5.set_yticklabels('')
+ax5.yaxis.set_ticks([])
+ax5.set_xticks(np.arange(1, len(temp_categories) + 1))
+ax5.set_xticklabels(temp_categories, rotation=45, ha="right")
+
+# Prec Precipitation
+ax6 = plt.subplot(gs[1, 2])
+ax6.axhline(0, color="black", alpha=0.5, linewidth=1.3, linestyle="--", dashes=(7, 3))
+for i, prec in enumerate(prec_categories):
+    stats = precipitation_stats[prec]
+    ax6.errorbar(
+        x=i + 1,
+        y=stats['effect_prec_mean'],
+        yerr=[[stats['effect_prec_mean'] - stats['effect_prec_lower_95']], [stats['effect_prec_upper_95'] - stats['effect_prec_mean']]],
+        fmt='o',
+        color=get_color(stats['effect_prec_mean']),
+        markersize = 7,
+        markeredgecolor='black',
+        markerfacecolor='white',
+        capsize=5,
+        elinewidth=6
+    )
+ax6.set_ylim(-1.25,4.8)
+ax6.set_ylabel('')
+ax6.set_yticklabels('')
+ax6.yaxis.set_ticks([])
+ax6.set_xticks(np.arange(1, len(prec_categories) + 1))
+ax6.set_xticklabels(prec_categories, rotation=45, ha="right")
+
+plt.tight_layout()
+plt.savefig("../fig/Fig3b regional heterogeinity.pdf")
+plt.show()
+```
+
+```{python SSP preprocessing: calculate teleconnection (SSPs)}
+import xarray as xr
+import numpy as np
+import pandas as pd
+import os
+import glob
+from scipy import signal, stats
+from statsmodels.formula.api import ols as reg
+from sklearn import preprocessing
+
+staryear_his = 1940
+endyear_his = 2019
+staryear_fu = 2020
+endyear_fu = 2099
+
+target_lat = list(range(-90, 91)) 
+target_lon = list(range(0, 361)) 
+
+models_ssp126 = ['BCC-CSM2-MR','CAMS-CSM1-0','CESM2-WACCM','CIESM','CMCC-CM2-SR5','CanESM5','CanESM5-1','EC-Earth3','EC-Earth3-Veg','EC-Earth3-Veg-LR',
+                 'FGOALS-g3','FIO-ESM-2-0', 'IPSL-CM6A-LR', 'IPSL-CM5A2-INCA','MIROC6','MRI-ESM2-0',
+                 'NESM3', 'CNRM-CM6-1','CNRM-CM6-1-HR','CNRM-ESM2-1', 'CanESM5-CanOE',
+                 'GFDL-ESM4','GISS-E2-1-G','HadGEM3-GC31-LL','HadGEM3-GC31-MM','INM-CM5-0','KACE-1-0-G','KIOST-ESM','MCM-UA-1-0',
+                 'MPI-ESM1-2-HR', 'MPI-ESM1-2-LR', 'UKESM1-0-LL']
+realizations_ssp126 = {
+    'BCC-CSM2-MR': ['r1i1p1f1'],
+    'CAMS-CSM1-0':[ 'r1i1p1f1'],
+    'CESM2-WACCM': ['r1i1p1f1'],
+    'CIESM': ['r1i1p1f1'],
+    'CMCC-CM2-SR5': ['r1i1p1f1'],
+    'CanESM5': ['r1i1p1f1'],
+    'CanESM5-1': ['r1i1p1f1'],
+    'EC-Earth3': ['r1i1p1f1'],
+    'EC-Earth3-Veg': ['r1i1p1f1'],
+    'EC-Earth3-Veg-LR':['r1i1p1f1'],
+    'FGOALS-g3': ['r1i1p1f1'],
+    'FIO-ESM-2-0': ['r1i1p1f1'],
+    'IPSL-CM6A-LR': ['r1i1p1f1'],
+    'IPSL-CM5A2-INCA': ['r1i1p1f1'],
+    'MIROC6':['r{}i1p1f1'.format(r) for r in [1,3,25,26,46,48,50]]+['r{}i1p1f1'.format(r) for r in range(5,14)]+ ['r{}i1p1f1'.format(r) for r in range(15,19)]+['r{}i1p1f1'.format(r) for r in range(20,24)]+['r{}i1p1f1'.format(r) for r in range(28,33)]+ ['r{}i1p1f1'.format(r) for r in range(34,38)]+ ['r{}i1p1f1'.format(r) for r in range(39,44)],
+    'MRI-ESM2-0': ['r1i1p1f1'],
+    'NESM3': ['r1i1p1f1'],
+    'CNRM-CM6-1':[ 'r1i1p1f2'],
+    'CNRM-CM6-1-HR':['r1i1p1f2'],
+    'CNRM-ESM2-1': ['r1i1p1f2'],
+    'CanESM5-CanOE': ['r1i1p2f1'],
+    'GFDL-ESM4':[ 'r1i1p1f1'],
+    'GISS-E2-1-G': ['r1i1p1f2'],
+    'HadGEM3-GC31-LL': ['r1i1p1f3'],
+    'HadGEM3-GC31-MM': ['r1i1p1f3'],
+    'INM-CM5-0': ['r1i1p1f1'],
+    'KACE-1-0-G': ['r1i1p1f1'],
+    'KIOST-ESM': ['r1i1p1f1'],
+    'MCM-UA-1-0': ['r1i1p1f2'],
+    'MPI-ESM1-2-HR': ['r1i1p1f1'],
+    'MPI-ESM1-2-LR':[ 'r1i1p1f1'],
+    'UKESM1-0-LL': ['r1i1p1f2']
+}
+
+models_ssp245 = ['BCC-CSM2-MR','CAMS-CSM1-0','CanESM5','CanESM5-1','CanESM5-CanOE','CAS-ESM2-0','CIESM', 'CNRM-CM6-1','CNRM-CM6-1-HR','CNRM-ESM2-1', 
+                 'EC-Earth3','EC-Earth3-CC','EC-Earth3-Veg','EC-Earth3-Veg-LR',
+                 'FGOALS-g3','FIO-ESM-2-0','GFDL-CM4','GFDL-ESM4','GISS-E2-1-G','HadGEM3-GC31-LL','INM-CM4-8','INM-CM5-0',
+                 'IPSL-CM6A-LR', 'KACE-1-0-G','MCM-UA-1-0','MIROC6','MPI-ESM1-2-HR','MPI-ESM1-2-LR','MRI-ESM2-0', 'NESM3','UKESM1-0-LL', 'MIROC-ES2L'
+                   ]
+realizations_ssp245 = {
+'BCC-CSM2-MR': ['r1i1p1f1'],
+'CAMS-CSM1-0': ['r1i1p1f1'],
+'CanESM5': ['r1i1p1f1'],
+'CanESM5-1': ['r1i1p1f1'],
+'CanESM5-CanOE': ['r1i1p2f1'],
+'CAS-ESM2-0': ['r1i1p1f1'],
+'CIESM': ['r1i1p1f1'],
+'CNRM-CM6-1': ['r1i1p1f2'],
+'CNRM-CM6-1-HR': ['r1i1p1f2'],
+'CNRM-ESM2-1': ['r1i1p1f2'],
+'EC-Earth3': ['r1i1p1f1'],
+'EC-Earth3-CC': ['r1i1p1f1'],
+'EC-Earth3-Veg': ['r1i1p1f1'],
+'EC-Earth3-Veg-LR': ['r1i1p1f1'],
+'FGOALS-g3': ['r1i1p1f1'],
+'FIO-ESM-2-0': ['r1i1p1f1'],
+'GFDL-CM4': ['r1i1p1f1'],
+'GFDL-ESM4': ['r1i1p1f1'],
+'GISS-E2-1-G': ['r1i1p1f2'],
+'HadGEM3-GC31-LL': ['r1i1p1f3'],
+'INM-CM4-8': ['r1i1p1f1'],
+'INM-CM5-0': ['r1i1p1f1'],
+'IPSL-CM6A-LR': ['r1i1p1f1'],
+'KACE-1-0-G': ['r1i1p1f1'],
+'MCM-UA-1-0': ['r1i1p1f2'],
+'MIROC6': ['r{}i1p1f1'.format(r) for r in [1,3,5,6,7,15,17,18,34,46,50]]+['r{}i1p1f1'.format(r) for r in range(9,14)]+ ['r{}i1p1f1'.format(r) for r in range(21,32)]+ ['r{}i1p1f1'.format(r) for r in range(36,44)],
+'MIROC-ES2L': ['r{}i1p1f2'.format(r) for r in [2,6,10,18,21,22,24,27,29,30]],
+'MPI-ESM1-2-HR': ['r1i1p1f1','r2i1p1f1'],
+'MPI-ESM1-2-LR': ['r{}i1p1f1'.format(r+1) for r in range(30)],
+'MRI-ESM2-0': ['r1i1p1f1'],
+'NESM3': ['r1i1p1f1'],
+'UKESM1-0-LL': ['r1i1p1f2']
+}
+models_ssp370 = ['BCC-CSM2-MR','CAMS-CSM1-0','CanESM5','CanESM5-1','CanESM5-CanOE','CAS-ESM2-0','CESM2-WACCM','CMCC-CM2-SR5',
+                 'CNRM-CM6-1','CNRM-CM6-1-HR','CNRM-ESM2-1', 'EC-Earth3','EC-Earth3-Veg','EC-Earth3-Veg-LR',
+                 'FGOALS-g3','GFDL-ESM4','GISS-E2-1-G','INM-CM4-8','INM-CM5-0', 'IPSL-CM5A2-INCA',
+                 'KACE-1-0-G','MCM-UA-1-0','MIROC6', 'MIROC-ES2L','MPI-ESM1-2-HR','MPI-ESM1-2-LR','MRI-ESM2-0','UKESM1-0-LL', 
+                   ]
+realizations_ssp370 = {
+'BCC-CSM2-MR': ['r1i1p1f1'],
+'CAMS-CSM1-0': ['r1i1p1f1'],
+'CanESM5': ['r1i1p1f1'],
+'CanESM5-1': ['r1i1p1f1'],
+'CanESM5-CanOE': ['r1i1p2f1'],
+'CAS-ESM2-0': ['r1i1p1f1'],
+'CESM2-WACCM': ['r1i1p1f1'],
+'CMCC-CM2-SR5': ['r1i1p1f1'],
+'CNRM-CM6-1': ['r1i1p1f2'],
+'CNRM-CM6-1-HR': ['r1i1p1f2'],
+'CNRM-ESM2-1': ['r1i1p1f2'],
+'EC-Earth3': ['r1i1p1f1'],
+'EC-Earth3-Veg': ['r1i1p1f1'],
+'EC-Earth3-Veg-LR': ['r1i1p1f1'],
+'FGOALS-g3': ['r1i1p1f1'],
+'GFDL-ESM4': ['r1i1p1f1'],
+'GISS-E2-1-G': ['r1i1p1f2'],
+'INM-CM4-8': ['r1i1p1f1'],
+'INM-CM5-0': ['r1i1p1f1'],
+'IPSL-CM5A2-INCA': ['r1i1p1f1'],
+'KACE-1-0-G': ['r1i1p1f1'],
+'MCM-UA-1-0': ['r1i1p1f2'],
+'MIROC6':['r{}i1p1f1'.format(r) for r in [3,5,6,7,15,25,26,43,48,50]]+['r{}i1p1f1'.format(r) for r in range(9,14)]+['r{}i1p1f1'.format(r) for r in range(19,24)]+['r{}i1p1f1'.format(r) for r in range(28,32)]+['r{}i1p1f1'.format(r) for r in range(35,42)],
+'MIROC-ES2L': ['r{}i1p1f2'.format(r) for r in [2,6]],
+'MPI-ESM1-2-HR': ['r{}i1p1f1'.format(r+1) for r in range(10)],
+'MPI-ESM1-2-LR': ['r{}i1p1f1'.format(r+1) for r in range(30)],
+'MRI-ESM2-0': ['r{}i1p1f1'.format(r+1) for r in range(5)],
+'UKESM1-0-LL': ['r1i1p1f2']
+}
+models_ssp585 =['BCC-CSM2-MR','CAMS-CSM1-0','CAS-ESM2-0','CESM2-WACCM','CIESM','CMCC-CM2-SR5','CanESM5','CanESM5-1','EC-Earth3','EC-Earth3-CC','EC-Earth3-Veg','EC-Earth3-Veg-LR',
+                 'FGOALS-g3','FIO-ESM-2-0', 'MRI-ESM2-0','NESM3', 'CNRM-CM6-1','CNRM-CM6-1-HR','CNRM-ESM2-1', 'CanESM5-CanOE','E3SM-1-1',
+                'GFDL-CM4','GFDL-ESM4','GISS-E2-1-G','HadGEM3-GC31-LL','HadGEM3-GC31-MM','INM-CM4-8','INM-CM5-0','KACE-1-0-G','KIOST-ESM','MCM-UA-1-0',
+                 'MPI-ESM1-2-HR', 'MPI-ESM1-2-LR', 'UKESM1-0-LL','MIROC6']
+realizations_ssp585 = {
+    'BCC-CSM2-MR': ['r1i1p1f1'],
+    'CAMS-CSM1-0': ['r1i1p1f1'],
+    'CAS-ESM2-0': ['r1i1p1f1'],
+    'CESM2-WACCM': ['r1i1p1f1'],
+    'CIESM': ['r1i1p1f1'],
+    'CMCC-CM2-SR5': ['r1i1p1f1'],
+    'CanESM5': ['r1i1p1f1'],
+    'CanESM5-1': ['r1i1p1f1'],
+    'EC-Earth3': ['r1i1p1f1'],
+    'EC-Earth3-CC': ['r1i1p1f1'],
+    'EC-Earth3-Veg':[ 'r1i1p1f1'],
+    'EC-Earth3-Veg-LR': ['r1i1p1f1'],
+    'FGOALS-g3':[ 'r1i1p1f1'],
+    'FIO-ESM-2-0':[ 'r1i1p1f1'],
+    'MRI-ESM2-0': ['r1i1p1f1'],
+    'NESM3': ['r1i1p1f1'],
+    'CNRM-CM6-1':[ 'r1i1p1f2'],
+    'CNRM-CM6-1-HR': ['r1i1p1f2'],
+    'CNRM-ESM2-1':[ 'r1i1p1f2'],
+    'CanESM5-CanOE': ['r1i1p2f1'],
+    'E3SM-1-1': ['r1i1p1f1'],
+    'GFDL-CM4': ['r1i1p1f1'],
+    'GFDL-ESM4': ['r1i1p1f1'],
+    'GISS-E2-1-G': ['r1i1p1f2'],
+    'HadGEM3-GC31-LL': ['r1i1p1f3'],
+    'HadGEM3-GC31-MM': ['r1i1p1f3'],
+    'INM-CM4-8': ['r1i1p1f1'],
+    'INM-CM5-0': ['r1i1p1f1'],
+    'KACE-1-0-G': ['r1i1p1f1'],
+    'KIOST-ESM': ['r1i1p1f1'],
+    'MCM-UA-1-0': ['r1i1p1f2'],
+    'MPI-ESM1-2-HR':[ 'r1i1p1f1','r2i1p1f1'],
+    'MPI-ESM1-2-LR':[ 'r1i1p1f1'],
+    'UKESM1-0-LL': ['r1i1p1f2'],
+    'MIROC6': ['r{}i1p1f1'.format(r) for r in [5,6,7,11,13,15,17,18,22,23,25,35,36,43,50]]+['r{}i1p1f1'.format(r) for r in range(28,32)]+ ['r{}i1p1f1'.format(r) for r in range(38,42)], 
+}
+
+def partial_correlation(x,y,z):
+    x = x.reset_index(drop=True)
+    y = y.reset_index(drop=True)
+    z = z.reset_index(drop=True)
+    df = pd.DataFrame({"x":x,"y":y,"z":z})
+    x_z_resids = reg("x~z",data=df).fit().resid.values
+    y_z_resids = reg("y~z",data=df).fit().resid.values
+    corr, p = stats.pearsonr(x_z_resids,y_z_resids)
+    return([corr,p])
+  
+#**Running-mean ssp-his Temperature 1940-2100**  #too large, not in file list
+for model in models_ssp370:
+    for realization in realizations_ssp370[model]:
+        print(model,realization)
+        input_path_370 = "Data/7.SSP/ssp370/ssp370-popwgt_temperature/popwgt_tas_" + str(model) + "_" + str(realization) + ".csv"
+        temp_370 = pd.read_csv(input_path_370)
+        input_path_his = "Data/7.SSP/historical/his-popwgt_temperature/popwgt_tas_" + str(model) + "_" + str(realization) + ".csv"
+        temp_his = pd.read_csv(input_path_his)
+        df = pd.concat([temp_his,temp_370])
+        
+        climate = 'Temperature' 
+        countries = df.columns[0:]
+        
+        if model in  ['CAMS-CSM1-0']:
+            date_range = pd.date_range(start='1939-01-01', end='2099-12-31', freq='MS')
+        else:
+            date_range = pd.date_range(start='1939-01-01', end='2100-12-31', freq='MS')
+            
+        date_column = date_range.strftime('%Y/%m')
+        year_column = date_range.year
+        month_column = date_range.month
+        df['date'] = date_column
+        df['year'] = year_column
+        df['month'] = month_column
+        DJF_result_data = []
+        JFM_result_data = []
+        FMA_result_data = []
+        MAM_result_data = []
+        for country in countries:
+            for year in range(1940, 2101):
+                DJF_Data_subset = df[((df['year'] == year-1) & (df['month'].between(12, 12))) | ((df['year'] == year ) & df['month'].between(1, 2))]
+                DJF_average_value = DJF_Data_subset[country].mean()
+                DJF_result_data.append({'year': year, 'country': country, climate: DJF_average_value})
+
+                JFM_data_subset = df[(df['year'] == year) & (df['month'].between(1, 3))]
+                JFM_average_value = JFM_data_subset[country].mean()
+                JFM_result_data.append({'year': year, 'country': country, climate: JFM_average_value})
+
+                FMA_data_subset = df[(df['year'] == year) & (df['month'].between(2, 4))]
+                FMA_average_value = FMA_data_subset[country].mean()
+                FMA_result_data.append({'year': year, 'country': country, climate: FMA_average_value})
+
+                MAM_data_subset = df[(df['year'] == year) & (df['month'].between(3, 5))]
+                MAM_average_value = MAM_data_subset[country].mean()
+                MAM_result_data.append({'year': year, 'country': country, climate: MAM_average_value})       
+
+        DJF_result_df = pd.DataFrame(DJF_result_data )
+        JFM_result_df = pd.DataFrame(JFM_result_data)
+        FMA_result_df = pd.DataFrame(FMA_result_data)
+        MAM_result_df = pd.DataFrame(MAM_result_data)
+
+
+        DJF_path ="Data/7.SSP/ssp370/runmean/ssp370-his_tas_" + str(model) + "_" + str(realization) + "-DJF.csv"
+        DJF_result_df.to_csv(DJF_path, index=False)
+        print(f"DJF temp saved: {DJF_path}")
+
+        JFM_path = "Data/7.SSP/ssp370/runmean/ssp370-his_tas_" + str(model) + "_" + str(realization) + "-JFM.csv"
+        JFM_result_df.to_csv(JFM_path, index=False)
+        print(f"JFM temp saved: {JFM_path}")
+
+        FMA_path = "Data/7.SSP/ssp370/runmean/ssp370-his_tas_" + str(model) + "_" + str(realization) + "-FMA.csv"
+        FMA_result_df.to_csv(FMA_path, index=False)
+        print(f"FMA temp saved: {FMA_path}")
+
+        MAM_path = "Data/7.SSP/ssp370/runmean/ssp370-his_tas_" + str(model) + "_" + str(realization) + "-MAM.csv"
+        MAM_result_df.to_csv(MAM_path, index=False)
+        print(f"MAM temp saved: {MAM_path}")
+        
+#**Running-sum ssp-his Precipitation 1940-2100**  
+for model in models_ssp370:
+    for realization in realizations_ssp370[model]:
+        print(model,realization)
+        input_path_370 = "Data/7.SSP/ssp370/ssp370-popwgt_precipitation/popwgt_pr_" + str(model) + "_" + str(realization) + ".csv"
+        prec_370 = pd.read_csv(input_path_370)
+        input_path_his = "Data/7.SSP/historical/his-popwgt_precipitation/popwgt_pr_" + str(model) + "_" + str(realization) + ".csv"
+        prec_his = pd.read_csv(input_path_his)
+        df = pd.concat([prec_his,prec_370])
+
+        climate = 'Precipitation' 
+        countries = df.columns[0:]
+        
+        if model in  ['CAMS-CSM1-0']:
+            date_range = pd.date_range(start='1939-01-01', end='2099-12-31', freq='MS')
+        else:
+            date_range = pd.date_range(start='1939-01-01', end='2100-12-31', freq='MS')
+        date_column = date_range.strftime('%Y/%m')
+        year_column = date_range.year
+        month_column = date_range.month
+        df['date'] = date_column
+        df['year'] = year_column
+        df['month'] = month_column
+
+        DJF_result_data = []
+        JFM_result_data = []
+        FMA_result_data = []
+        MAM_result_data = []
+  
+        for country in countries:
+            for year in range(1940, 2101):
+
+                DJF_Data_subset = df[((df['year'] == year-1) & (df['month'].between(12, 12))) | ((df['year'] == year ) & df['month'].between(1, 2))]
+                DJF_average_value = DJF_Data_subset[country].sum()
+                DJF_result_data.append({'year': year, 'country': country, climate: DJF_average_value})
+
+                JFM_data_subset = df[(df['year'] == year) & (df['month'].between(1, 3))]
+                JFM_average_value = JFM_data_subset[country].sum()
+                JFM_result_data.append({'year': year, 'country': country, climate: JFM_average_value})
+
+                FMA_data_subset = df[(df['year'] == year) & (df['month'].between(2, 4))]
+                FMA_average_value = FMA_data_subset[country].sum()
+                FMA_result_data.append({'year': year, 'country': country, climate: FMA_average_value})
+
+                MAM_data_subset = df[(df['year'] == year) & (df['month'].between(3, 5))]
+                MAM_average_value = MAM_data_subset[country].sum()
+                MAM_result_data.append({'year': year, 'country': country, climate: MAM_average_value})       
+
+        DJF_result_df = pd.DataFrame(DJF_result_data)
+        JFM_result_df = pd.DataFrame(JFM_result_data)
+        FMA_result_df = pd.DataFrame(FMA_result_data)
+        MAM_result_df = pd.DataFrame(MAM_result_data)
+
+        DJF_path ="Data/7.SSP/ssp370/runmean/ssp370-his_pr_" + str(model) + "_" + str(realization) + "-DJF.csv"
+        DJF_result_df.to_csv(DJF_path, index=False)
+        print(f"DJF prec saved: {DJF_path}")
+
+        JFM_path ="Data/7.SSP/ssp370/runmean/ssp370-his_pr_" + str(model) + "_" + str(realization) +  "-JFM.csv"
+        JFM_result_df.to_csv(JFM_path, index=False)
+        print(f"JFM prec saved: {JFM_path}")
+
+        FMA_path = "Data/7.SSP/ssp370/runmean/ssp370-his_pr_" + str(model) + "_" + str(realization) + "-FMA.csv"
+        FMA_result_df.to_csv(FMA_path, index=False)
+        print(f"FMA prec saved: {FMA_path}")
+
+        MAM_path = "Data/7.SSP/ssp370/runmean/ssp370-his_pr_" + str(model) + "_" + str(realization) + "-MAM.csv"
+        MAM_result_df.to_csv(MAM_path, index=False)
+        print(f"MAM prec saved: {MAM_path}")
+        
+#**Detrend and standardize climate data ssp tas 1940-2099**          
+season = ['DJF','JFM','FMA','MAM']
+climate = 'tas'
+#370 temperature
+for model in models_ssp370:
+    for realization in realizations_ssp370[model]:
+        for t in season:
+            path = f"Data/7.SSP/ssp370/runmean/ssp370-his_{climate}_{model}_{realization}-{t}"
+            data = pd.read_csv(f"{path}.csv")
+            data = data[(data['year'] >= 1940) & (data['year'] <= 2099)]
+            countries = data['country'].unique()
+
+            processed_data_1940_2019 = pd.DataFrame()
+            processed_data_2020_2099 = pd.DataFrame()
+
+            for country in countries:
+                country_data = data[data['country']==country]
+                Temperatures =  country_data['Temperature']
+                # 1940-2019
+                data_1940_2019 = country_data[(country_data['year'] >= 1940) & (country_data['year'] <= 2019)]
+                if not data_1940_2019.empty:
+                    temps_1940_2019 = data_1940_2019['Temperature']
+                    detrended_temps_1940_2019 = signal.detrend(temps_1940_2019, type='linear')
+                    standardized_temps_1940_2019 = preprocessing.scale(detrended_temps_1940_2019, axis=0)
+                    processed_data_1940_2019[country] = standardized_temps_1940_2019
+                # 2020-2099
+                data_2020_2099 = country_data[(country_data['year'] >= 2020) & (country_data['year'] <= 2099)]
+                if not data_2020_2099.empty:
+                    temps_2020_2099 = data_2020_2099['Temperature']
+                    detrended_temps_2020_2099 = signal.detrend(temps_2020_2099, type='linear')
+                    standardized_temps_2020_2099 = preprocessing.scale(detrended_temps_2020_2099, axis=0)
+                    processed_data_2020_2099[country] = standardized_temps_2020_2099
+
+            processed_data_1940_2019.to_csv(f"{path}-detrended-standardized-1940-2019.csv", index=False)
+            processed_data_2020_2099.to_csv(f"{path}-detrended-standardized-2020-2099.csv", index=False)
+
+#**Detrend and standardize climate data ssp370 pr**  
+season = ['DJF','JFM','FMA','MAM']
+climate = 'pr'
+#370 precipitation
+for model in models_ssp370:
+    for realization in realizations_ssp370[model]:
+        for t in season:
+            path = f"Data/7.SSP/ssp370/runmean/ssp370-his_{climate}_{model}_{realization}-{t}"
+            data = pd.read_csv(f"{path}.csv")
+            data = data[(data['year'] >= 1940) & (data['year'] <= 2099)]
+            countries = data['country'].unique()
+            processed_data_1940_2019 = pd.DataFrame()
+            processed_data_2020_2099 = pd.DataFrame()
+
+            for country in countries:
+                country_data = data[data['country']==country]
+                Temperatures =  country_data['Precipitation']
+
+                # 1940-2019
+                data_1940_2019 = country_data[(country_data['year'] >= 1940) & (country_data['year'] <= 2019)]
+                if not data_1940_2019.empty:
+                    temps_1940_2019 = data_1940_2019['Precipitation']
+                    detrended_temps_1940_2019 = signal.detrend(temps_1940_2019, type='linear')
+                    standardized_temps_1940_2019 = preprocessing.scale(detrended_temps_1940_2019, axis=0)
+                    processed_data_1940_2019[country] = standardized_temps_1940_2019
+
+                # 2020-2099
+                data_2020_2099 = country_data[(country_data['year'] >= 2020) & (country_data['year'] <= 2099)]
+                if not data_2020_2099.empty:
+                    temps_2020_2099 = data_2020_2099['Precipitation']
+                    detrended_temps_2020_2099 = signal.detrend(temps_2020_2099, type='linear')
+                    standardized_temps_2020_2099 = preprocessing.scale(detrended_temps_2020_2099, axis=0)
+                    processed_data_2020_2099[country] = standardized_temps_2020_2099
+
+            processed_data_1940_2019.to_csv(f"{path}-detrended-standardized-1940-2019.csv", index=False)
+            processed_data_2020_2099.to_csv(f"{path}-detrended-standardized-2020-2099.csv", index=False)
+
+#**Detrend and standardize 370 nino**       
+for model in models_ssp370:
+    for realization in realizations_ssp370[model]:
+        nino_path = f"Data/7.SSP/ssp370/NINO34/ssp370_his_DJFNINO34_{model}_{realization}"
+        data = pd.read_csv(f"{nino_path}.csv")
+        
+        if 'NINO3.4' not in data.columns:
+            raise KeyError(f"Column 'NINO3.4' not found in {nino_path}")
+        
+        # 1940-2019
+        data_1940_2019 = data[(data['year'] >= 1940) & (data['year'] <= 2019)]
+        if not data_1940_2019.empty:
+            nino_1940_2019 = data_1940_2019['NINO3.4']
+            detrended_nino_1940_2019 = signal.detrend(nino_1940_2019, type='linear')
+            standardized_nino_1940_2019 = preprocessing.scale(detrended_nino_1940_2019, axis=0)
+            df_1940_2019 = pd.DataFrame(standardized_nino_1940_2019, columns=['NINO3.4'])
+
+        # 2020-2099
+        data_2020_2099 = data[(data['year'] >= 2020) & (data['year'] <= 2099)]
+        if not data_2020_2099.empty:
+            nino_2020_2099 = data_2020_2099['NINO3.4']
+            detrended_nino_2020_2099 = signal.detrend(nino_2020_2099, type='linear')
+            standardized_nino_2020_2099 = preprocessing.scale(detrended_nino_2020_2099, axis=0)
+            df_2020_2099 = pd.DataFrame(standardized_nino_2020_2099, columns=['NINO3.4'])
+
+        df_1940_2019.to_csv(f"{nino_path}-detrended-standardized-1940-2019.csv", index=False)
+        df_2020_2099.to_csv(f"{nino_path}-detrended-standardized-2020-2099.csv", index=False)
+
+######**Partial Correlation**  
+#tas pr 1940-2099  
+#nino 1940-2099  
+
+#ssp370 past  
+max_corr_t_values_all = {}
+max_corr_p_values_all = {}
+for model in models_ssp370:
+    for realization in realizations_ssp370[model]:
+        max_corr_t_values = {}
+        max_corr_p_values = {} 
+        print(model," :",realization)
+        for t in season:
+            temp_path_1940_2019 = f"Data/7.SSP/ssp370/runmean/ssp370-his_tas_{model}_{realization}-{t}-detrended-standardized-1940-2019.csv"
+            temp_path_2020_2099 = f"Data/7.SSP/ssp370/runmean/ssp370-his_tas_{model}_{realization}-{t}-detrended-standardized-2020-2099.csv"
+            prec_path_1940_2019 = f"Data/7.SSP/ssp370/runmean/ssp370-his_pr_{model}_{realization}-{t}-detrended-standardized-1940-2019.csv"
+            prec_path_2020_2099 = f"Data/7.SSP/ssp370/runmean/ssp370-his_pr_{model}_{realization}-{t}-detrended-standardized-2020-2099.csv"
+            nino_path_1940_2019 = f"Data/7.SSP/ssp370/NINO34/ssp370_his_DJFNINO34_{model}_{realization}-detrended-standardized-1940-2019.csv"
+            nino_path_2020_2099 = f"Data/7.SSP/ssp370/NINO34/ssp370_his_DJFNINO34_{model}_{realization}-detrended-standardized-2020-2099.csv"
+
+            df_nino_future = pd.read_csv(nino_path_2020_2099)
+            df_nino_past = pd.read_csv(nino_path_1940_2019)
+
+            df_temp_future =  pd.read_csv(temp_path_2020_2099)
+            df_temp_past = pd.read_csv(temp_path_1940_2019)
+
+            df_prec_future = pd.read_csv(prec_path_2020_2099)
+            df_prec_past = pd.read_csv(prec_path_1940_2019)
+
+            nino_columns = df_nino_past.columns[0:1] 
+            precipitation_columns = df_prec_past.columns[0:61]  
+            temperature_columns = df_temp_past.columns[0:61]  
+
+            tresult_df = pd.DataFrame(columns=['Country'] + [t + '_tcorr'], index=range(len(temperature_columns)))
+            presult_df = pd.DataFrame(columns=['Country'] + [t + '_pcorr'], index=range(len(precipitation_columns)))
+            
+            for idx, (temp_col, prec_col) in enumerate(zip(temperature_columns, precipitation_columns)):
+                x = df_temp_past[temp_col]
+                y = df_nino_past[nino_columns[0]]
+                z = df_prec_past[prec_col]
+
+                tcorr, tp = partial_correlation(x, y, z)
+                pcorr, pp = partial_correlation(z, y, x)
+
+                tresult_df.at[idx, 'Country'] = temp_col
+                tresult_df.at[idx, t + '_tcorr'] = tcorr
+                presult_df.at[idx, 'Country'] = prec_col
+                presult_df.at[idx, t + '_pcorr'] = pcorr
+
+                if temp_col not in max_corr_t_values or abs(tcorr) > abs(max_corr_t_values[temp_col]['max_t_corr']):
+                    max_corr_t_values[temp_col] = {'max_t_corr': tcorr, 't_season': t}
+                if prec_col not in max_corr_p_values or abs(pcorr) > abs(max_corr_p_values[prec_col]['max_p_corr']):
+                    max_corr_p_values[prec_col] = {'max_p_corr': pcorr, 'p_season': t}
+
+            tresult_df.to_csv("Data/7.SSP/ssp370/Tele-ssp370/ssp370_past_tas_" + str(model) + "_" + str(realization)+ "-" + t + "-tele_temp.csv") 
+            presult_df.to_csv("Data/7.SSP/ssp370/Tele-ssp370/ssp370_past_pr_" + str(model) + "_" + str(realization)+ "-" + t + "-tele_prec.csv") 
+            max_corr_t_values_all[(model, realization)] = max_corr_t_values
+            max_corr_p_values_all[(model, realization)] = max_corr_p_values
+
+for (model, realization), max_corr_t_values in max_corr_t_values_all.items():     
+    df_t = pd.DataFrame(max_corr_t_values).T.reset_index().rename(columns={'index': 'Country'})
+    df_t.to_csv(f"Data/7.SSP/ssp370/Tele-ssp370/tele_ssp370_past_tas_{model}_{realization}-max_corr_t_values.csv", index=False)   
+for (model, realization), max_corr_p_values in max_corr_p_values_all.items():
+    df_p = pd.DataFrame(max_corr_p_values).T.reset_index().rename(columns={'index': 'Country'})
+    df_p.to_csv(f"Data/7.SSP/ssp370/Tele-ssp370/tele_ssp370_past_pr_{model}_{realization}-max_corr_p_values.csv", index=False)
+
+#ssp370 future 
+max_corr_t_values_all = {}
+max_corr_p_values_all = {}
+for model in models_ssp370:
+    for realization in realizations_ssp370[model]:
+        max_corr_t_values = {}
+        max_corr_p_values = {} 
+        print(model," :",realization)
+        for t in season:
+            temp_path_1940_2019 = f"Data/7.SSP/ssp370/runmean/ssp370-his_tas_{model}_{realization}-{t}-detrended-standardized-1940-2019.csv"
+            temp_path_2020_2099 = f"Data/7.SSP/ssp370/runmean/ssp370-his_tas_{model}_{realization}-{t}-detrended-standardized-2020-2099.csv"
+            prec_path_1940_2019 = f"Data/7.SSP/ssp370/runmean/ssp370-his_pr_{model}_{realization}-{t}-detrended-standardized-1940-2019.csv"
+            prec_path_2020_2099 = f"Data/7.SSP/ssp370/runmean/ssp370-his_pr_{model}_{realization}-{t}-detrended-standardized-2020-2099.csv"
+            nino_path_1940_2019 = f"Data/7.SSP/ssp370/NINO34/ssp370_his_DJFNINO34_{model}_{realization}-detrended-standardized-1940-2019.csv"
+            nino_path_2020_2099 = f"Data/7.SSP/ssp370/NINO34/ssp370_his_DJFNINO34_{model}_{realization}-detrended-standardized-2020-2099.csv"
+
+            df_nino_future = pd.read_csv(nino_path_2020_2099)
+            df_nino_past = pd.read_csv(nino_path_1940_2019)
+
+            df_temp_future =  pd.read_csv(temp_path_2020_2099)
+            df_temp_past = pd.read_csv(temp_path_1940_2019)
+
+            df_prec_future = pd.read_csv(prec_path_2020_2099)
+            df_prec_past = pd.read_csv(prec_path_1940_2019)
+
+            nino_columns = df_nino_future.columns[0:1] 
+            precipitation_columns = df_prec_future.columns[0:61]  
+            temperature_columns = df_temp_future.columns[0:61]  
+
+            tresult_df = pd.DataFrame(columns=['Country'] + [t + '_tcorr'], index=range(len(temperature_columns)))
+            presult_df = pd.DataFrame(columns=['Country'] + [t + '_pcorr'], index=range(len(precipitation_columns)))
+            
+            for idx, (temp_col, prec_col) in enumerate(zip(temperature_columns, precipitation_columns)):
+                x = df_temp_future[temp_col]
+                y = df_nino_future[nino_columns[0]]
+                z = df_prec_future[prec_col]
+
+                tcorr, tp = partial_correlation(x, y, z)
+                pcorr, pp = partial_correlation(z, y, x)
+
+                tresult_df.at[idx, 'Country'] = temp_col
+                tresult_df.at[idx, t + '_tcorr'] = tcorr
+                presult_df.at[idx, 'Country'] = prec_col
+                presult_df.at[idx, t + '_pcorr'] = pcorr
+
+                if temp_col not in max_corr_t_values or abs(tcorr) > abs(max_corr_t_values[temp_col]['max_t_corr']):
+                    max_corr_t_values[temp_col] = {'max_t_corr': tcorr, 't_season': t}
+                if prec_col not in max_corr_p_values or abs(pcorr) > abs(max_corr_p_values[prec_col]['max_p_corr']):
+                    max_corr_p_values[prec_col] = {'max_p_corr': pcorr, 'p_season': t}
+
+            tresult_df.to_csv("Data/7.SSP/ssp370/Tele-ssp370/ssp370_future_tas_" + str(model) + "_" + str(realization)+ "-" + t + "-tele_temp.csv") 
+            presult_df.to_csv("Data/7.SSP/ssp370/Tele-ssp370/ssp370_future_pr_" + str(model) + "_" + str(realization)+ "-" + t + "-tele_prec.csv") 
+            max_corr_t_values_all[(model, realization)] = max_corr_t_values
+            max_corr_p_values_all[(model, realization)] = max_corr_p_values
+
+for (model, realization), max_corr_t_values in max_corr_t_values_all.items():     
+    df_t = pd.DataFrame(max_corr_t_values).T.reset_index().rename(columns={'index': 'Country'})
+    df_t.to_csv(f"Data/7.SSP/ssp370/Tele-ssp370/tele_ssp370_future_tas_{model}_{realization}-max_corr_t_values.csv", index=False)   
+for (model, realization), max_corr_p_values in max_corr_p_values_all.items():
+    df_p = pd.DataFrame(max_corr_p_values).T.reset_index().rename(columns={'index': 'Country'})
+    df_p.to_csv(f"Data/7.SSP/ssp370/Tele-ssp370/tele_ssp370_future_pr_{model}_{realization}-max_corr_p_values.csv", index=False)
+            
+print('finished')
+```
+
+```{python SSP preprocessing: calculate NINO3.4 amplitude change}
+import xarray as xr
+import numpy as np
+import pandas as pd
+import os
+import seaborn as sns
+import statistics
+def calculate_nino_change(nino34_std_past,nino34_std_future,filepath):
+    df = pd.read_csv(filepath)
+    nino_data = df.loc[(df['year']>=1940)&(df['year']<=2099),'NINO3.4']
+    years = df.loc[(df['year']>=1940)&(df['year']<=2099),'year']
+    
+    #quadratically detrend for 1940-2099
+    coeffs = np.polyfit(years,nino_data,2)
+    trend = np.polyval(coeffs, years)
+    detrended_data = nino_data-trend
+    
+    nino_data_past = detrended_data[(df['year'] >= 1940) & (df['year'] <= 2019)]
+    nino_data_future = detrended_data[(df['year'] >= 2020) & (df['year'] <= 2099)]
+
+    nino34_std_future = nino_data_future.std()
+    nino34_std_past = nino_data_past.std()
+
+    nino34_change_rate = (nino34_std_future - nino34_std_past) / nino34_std_past *100
+    return(nino34_std_past,nino34_std_future,nino34_change_rate)
+
+
+for sce in ['126','245','370','585']:#
+    amp_change = []
+    amp_change_value = []
+    past = []
+    future = []
+    for model in globals()[f'models_ssp{sce}']:
+        realizations = globals()[f'realizations_ssp{sce}']
+        for realization in realizations[model]:
+            NINO34_path = "Data/7.SSP/ssp"+str(sce)+"/NINO34/ssp"+str(sce)+"_his_DJFNINO34_" + str(model) + "_" + str(realization) + ".csv"
+            past,future,change = calculate_nino_change(past,future,NINO34_path)
+            amp_change.append([model,realization,past,future,change])
+            amp_change_value.append(change)
+    print(sce, amp_change)
+    print(sce, statistics.median(amp_change_value))
+```
+
+```{python}{RMSE high skill}
+import numpy as np
+import pandas as pd
+import os
+
+def RMSE(obs, pre):
+    """
+    Root mean squared error
+    Args:
+        obs (numpy.ndarray): observations
+        pre (numpy.ndarray): prediction
+    Returns:
+        float: root mean squared error between observed and simulated values
+    """
+    obs = obs.flatten()
+    pre = pre.flatten()
+
+    return np.sqrt(np.mean((obs - pre) ** 2))
+
+def ACC(obs, pre):
+    """
+    Anomaly Correlation Coefficient (ACC)
+    Args:
+        obs (numpy.ndarray): observations
+        pre (numpy.ndarray): prediction
+    Returns:
+        float: ACC between observed and simulated values
+    """
+    obs = obs.flatten()
+    pre = pre.flatten()
+
+    numerator = np.sum(obs * pre)
+    denominator = np.sqrt(np.sum(pre ** 2) * np.sum(obs ** 2))
+
+    return numerator / denominator
+
+def StD(obs, pre):
+    """
+    Standard Deviation
+    Args:
+        obs (numpy.ndarray): observations
+        pre (numpy.ndarray): prediction
+    Returns:
+        bool: Whether the standard deviation of pre is higher than 50% of the standard deviation of obs
+    """
+    obs_std = np.std(obs)
+    pre_std = np.std(pre)
+
+    return 0.5 * obs_std < pre_std < 1.5 * obs_std
+
+obs_path = "Data/1.ENSO_index/NINO3.4_yearly.xlsx"
+
+obs_data = pd.read_excel(obs_path, usecols=[1]).values
+pre_folder ="Data/7.SSP/NINO34-ssp245/NINO34/"
+pre_files = os.listdir(pre_folder)
+
+results = []
+
+for pre_file in pre_files:
+    if pre_file.endswith(".csv"):
+        pre_data = pd.read_csv(os.path.join(pre_folder, pre_file))
+        pre_data = pre_data[(pre_data['year'] >= 1980) & (pre_data['year'] <= 2024)]
+        pre_data = pre_data.iloc[:, 1].values
+        rmse = RMSE(obs_data, pre_data)
+        acc= ACC(obs_data, pre_data)
+        std= StD(obs_data, pre_data)
+        results.append((pre_file, rmse,acc,std))
+
+# Convert results to DataFrame
+results_df = pd.DataFrame(results, columns=['File', 'RMSE','ACC','StD'])
+
+# Write DataFrame to CSV
+results_df.to_csv("Data/7.SSP/hiskill_results.csv", index=False)
+
+print("Results saved to RMSE and ACC results.csv")
+```
+
+```{python SSP preprocessing: calculate teleconnction amplitude change}
+import xarray as xr
+import numpy as np
+import pandas as pd
+import os
+import glob
+import matplotlib.pyplot as plt
+from matplotlib import rcParams
+import matplotlib.colors as colors
+import matplotlib.gridspec as gridspec
+import seaborn as sns
+import statistics
+import geopandas as gpd
+from mpl_toolkits.basemap import Basemap
+
+#Teleconnection_amplitude  
+#past_future_126 245 370 585
+
+#ssp1-2.6 as an example
+amp_126_temp_past = []
+amp_126_prec_past = []
+amp_126_temp_future = []
+amp_126_prec_future = []
+amp_126_temp_change = []
+amp_126_prec_change = []
+mo126=[]
+reali126=[]
+exclude_countries = ['Chile', 'China', 'Argentina', 'United States of America']
+for model in models_ssp126:
+    for realization in realizations_ssp126[model]:
+        mo126.append(model)
+        reali126.append(realization)
+        future_t_path = "Data/7.SSP/ssp126/Tele-ssp126/tele_ssp126_future_tas_" + str(model) + "_" + str(realization) + "-max_corr_t_values.csv"
+        past_t_path = "Data/7.SSP/ssp126/Tele-ssp126/tele_ssp126_past_tas_" + str(model) + "_" + str(realization) + "-max_corr_t_values.csv"
+        future_p_path = "Data/7.SSP/ssp126/Tele-ssp126/tele_ssp126_future_pr_" + str(model) + "_" + str(realization) + "-max_corr_p_values.csv"
+        past_p_path = "Data/7.SSP/ssp126/Tele-ssp126/tele_ssp126_past_pr_" + str(model) + "_" + str(realization) + "-max_corr_p_values.csv"
+
+        df_t_past = pd.read_csv(past_t_path,header=0,names=['Country', 'Value','month'])
+        df_t_future = pd.read_csv(future_t_path, header=0, names=['Country', 'Value','month'])
+        df_t_past = df_t_past[~df_t_past['Country'].isin(exclude_countries)]
+        df_t_future = df_t_future[~df_t_future['Country'].isin(exclude_countries)]
+        
+        amp_t_future = abs(df_t_future['Value']).mean()
+        amp_t_past = abs(df_t_past['Value']).mean()
+        amp_126_temp_past.append(amp_t_past)
+        amp_126_temp_future.append(amp_t_future)
+        change_rate_t = (abs(amp_t_future)-abs(amp_t_past)) / abs(amp_t_past) *100
+        amp_126_temp_change.append(change_rate_t)
+
+        df_p_past = pd.read_csv(past_p_path,header=0,names=['Country', 'Value','month'])
+        df_p_future = pd.read_csv(future_p_path, header=0, names=['Country', 'Value','month'])
+        df_p_past = df_p_past[~df_p_past['Country'].isin(exclude_countries)]
+        df_p_future = df_p_future[~df_p_future['Country'].isin(exclude_countries)]
+        
+        amp_p_future = abs(df_p_future['Value']).mean()
+        amp_p_past = abs(df_p_past['Value']).mean()
+        amp_126_prec_past.append(amp_p_past)
+        amp_126_prec_future.append(amp_p_future)
+        change_rate_p = (abs(amp_p_future)-abs(amp_p_past)) / abs(amp_p_past) *100
+        amp_126_prec_change.append(change_rate_p)
+
+print("Teleconnection 126temp_past:",amp_126_temp_past)
+print(statistics.median(amp_126_temp_past))
+print("Teleconnection 126temp_future:",amp_126_temp_future)
+print(statistics.median(amp_126_temp_future))
+
+print("Teleconnection 126prec_past:",amp_126_prec_past)
+print(statistics.median(amp_126_prec_past))
+print("Teleconnection 126prec_future:",amp_126_prec_future)
+print(statistics.median(amp_126_prec_future))
+
+print("Tele_amp_change% 126temp:",amp_126_temp_change)
+print(statistics.median(amp_126_temp_change))
+print("Tele_amp_change% 126prec",amp_126_prec_change)
+print(statistics.median(amp_126_prec_change))
+
+df_out = pd.DataFrame({'Model': mo126,'Realization': reali126, '126temp_past': amp_126_temp_past,'126temp_future': amp_126_temp_future,'126temp_change%': amp_126_temp_change})
+df_out.to_csv("Data/7.SSP/ssp126/Teleconnection_amplitude_change/Teleconnection_amplitude_and_change_126temp.csv", index=False)
+df_out = pd.DataFrame({'Model': mo126,'Realization': reali126, '126prec_past': amp_126_prec_past,'126prec_future': amp_126_prec_future,'126prec_change%': amp_126_prec_change})
+df_out.to_csv("Data/7.SSP/ssp126/Teleconnection_amplitude_change/Teleconnection_amplitude_and_change_126prec.csv", index=False)
+
+```
+
+```{python Figure 4abc}
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from matplotlib import gridspec
+from matplotlib import rcParams
+from matplotlib.collections import PolyCollection 
+
+nino_126_path = "Data/7.SSP/ssp126/NINO_amp_change/nino34_amp_change_ssp126.csv"
+nino_245_path = "Data/7.SSP/ssp245/NINO_amp_change/nino34_amp_change_ssp245.csv"
+nino_370_path = "Data/7.SSP/ssp370/NINO_amp_change/nino34_amp_change_ssp370.csv"
+nino_585_path = "Data/7.SSP/ssp585/NINO_amp_change/nino34_amp_change_ssp585.csv"
+nino_126 = pd.read_csv(nino_126_path)
+nino_245 = pd.read_csv(nino_245_path)
+nino_370 = pd.read_csv(nino_370_path)
+nino_585 = pd.read_csv(nino_585_path)
+amp_change_nino_126 = nino_126['4']
+amp_change_nino_245 = nino_245['4']
+amp_change_nino_370 = nino_370['4']
+amp_change_nino_585 = nino_585['4']
+
+tele_126_t_path = "Data/7.SSP/ssp126/Teleconnection_amplitude_change/Teleconnection_amplitude_and_change_126temp.csv"
+tele_245_t_path = "Data/7.SSP/ssp245/Teleconnection_amplitude_change/Teleconnection_amplitude_and_change_245temp.csv"
+tele_370_t_path = "Data/7.SSP/ssp370/Teleconnection_amplitude_change/Teleconnection_amplitude_and_change_370temp.csv"
+tele_585_t_path = "Data/7.SSP/ssp585/Teleconnection_amplitude_change/Teleconnection_amplitude_and_change_585temp.csv"
+tele_t_126 = pd.read_csv(tele_126_t_path)
+tele_t_245 = pd.read_csv(tele_245_t_path)
+tele_t_370 = pd.read_csv(tele_370_t_path)
+tele_t_585 = pd.read_csv(tele_585_t_path)
+amp_change_tele_t_126 = tele_t_126['126temp_change%']
+amp_change_tele_t_245 = tele_t_245['245temp_change%']
+amp_change_tele_t_370 = tele_t_370['370temp_change%']
+amp_change_tele_t_585 = tele_t_585['585temp_change%']
+
+tele_126_p_path = "Data/7.SSP/ssp126/Teleconnection_amplitude_change/Teleconnection_amplitude_and_change_126prec.csv"
+tele_245_p_path = "Data/7.SSP/ssp245/Teleconnection_amplitude_change/Teleconnection_amplitude_and_change_245prec.csv"
+tele_370_p_path = "Data/7.SSP/ssp370/Teleconnection_amplitude_change/Teleconnection_amplitude_and_change_370prec.csv"
+tele_585_p_path = "Data/7.SSP/ssp585/Teleconnection_amplitude_change/Teleconnection_amplitude_and_change_585prec.csv"
+tele_p_126 = pd.read_csv(tele_126_p_path)
+tele_p_245 = pd.read_csv(tele_245_p_path)
+tele_p_370 = pd.read_csv(tele_370_p_path)
+tele_p_585 = pd.read_csv(tele_585_p_path)
+amp_change_tele_p_126 = tele_p_126['126prec_change%']
+amp_change_tele_p_245 = tele_p_245['245prec_change%']
+amp_change_tele_p_370 = tele_p_370['370prec_change%']
+amp_change_tele_p_585 = tele_p_585['585prec_change%']
+
+def filter_outliers(data):
+    mean = np.mean(data)
+    print(mean)
+    std = np.std(data)
+    print(std)
+    filtered_data = data[(data > mean - 3 * std) & (data < mean + 3 * std)]
+    return filtered_data
+
+def get_std_range(data):
+    mean = np.mean(data)
+    std = np.std(data)
+    lower_bound = mean - std
+    upper_bound = mean + std
+    return lower_bound, upper_bound
+        
+amp_change_tele_t_126 = filter_outliers(amp_change_tele_t_126)
+amp_change_tele_t_245 = filter_outliers(amp_change_tele_t_245)
+amp_change_tele_t_370 = filter_outliers(amp_change_tele_t_370)
+amp_change_tele_t_585 = filter_outliers(amp_change_tele_t_585)
+amp_change_tele_p_126 = filter_outliers(amp_change_tele_p_126)
+amp_change_tele_p_245 = filter_outliers(amp_change_tele_p_245)
+amp_change_tele_p_370 = filter_outliers(amp_change_tele_p_370)
+amp_change_tele_p_585 = filter_outliers(amp_change_tele_p_585)
+
+std_range_nino_126 = get_std_range(amp_change_nino_126)
+std_range_nino_245 = get_std_range(amp_change_nino_245)
+std_range_nino_370 = get_std_range(amp_change_nino_370)
+std_range_nino_585 = get_std_range(amp_change_nino_585)
+
+std_range_tele_t_126 = get_std_range(amp_change_tele_t_126)
+std_range_tele_t_245 = get_std_range(amp_change_tele_t_245)
+std_range_tele_t_370 = get_std_range(amp_change_tele_t_370)
+std_range_tele_t_585 = get_std_range(amp_change_tele_t_585)
+std_range_tele_p_126 = get_std_range(amp_change_tele_p_126)
+std_range_tele_p_245 = get_std_range(amp_change_tele_p_245)
+std_range_tele_p_370 = get_std_range(amp_change_tele_p_370)
+std_range_tele_p_585 = get_std_range(amp_change_tele_p_585)
+
+
+fig = plt.figure(figsize=(10, 5))
+rcParams["font.family"] = "Arial"
+rcParams["font.size"] = 15.0
+rcParams["axes.linewidth"] = 1.3
+rcParams["mathtext.default"] = "regular"
+rcParams["pdf.fonttype"] = 42 
+
+tfs = 15
+lfs = 15
+gs1 = gridspec.GridSpec(1, 3)
+gs1.update(left=0.05, right=0.95, top=0.90, bottom=0.2, wspace=0.1, hspace=0)
+
+def plot_violin(ax, data_126, data_245, data_370, data_585, title, x_label, xlim):
+    data = pd.DataFrame({
+        'SSP126': data_126,
+        'SSP245': data_245,
+        'SSP370': data_370,
+        'SSP585': data_585
+    })
+
+    data_melted = data.melt(var_name='Scenario', value_name='Value')
+    palette = ["#96CAC1", "sandybrown", "red", "#6A3D99"]
+    violin = sns.violinplot(ax=ax, y='Scenario', x='Value', data=data_melted, palette=palette,split=True, inner="box",
+                            linewidth=1.3, cut=0)
+    
+    for i, collection in enumerate(violin.collections):
+        if isinstance(collection, PolyCollection):
+            collection.set_alpha(0.5)
+            collection.set_edgecolor(palette[i // 2]) 
+            
+    ax.axvline(0, color='black', linestyle='--', linewidth=1.3)
+    ax.set_xlim(xlim)
+    ax.set_title(title, fontsize=tfs)
+    ax.set_xlabel(x_label, fontsize=lfs)
+    ax.set_yticklabels([])
+    ax.yaxis.set_ticks([])
+    ax.set_ylabel('')
+
+ax1 = plt.subplot(gs1[0, 0])
+x_lim_nino = [-37, 61]
+plot_violin(ax1, 
+            amp_change_nino_126,  amp_change_nino_245,  amp_change_nino_370, amp_change_nino_585, 
+            "ENSO amplitude",
+            "Change in ENSO amplitude (%)", x_lim_nino)
+
+ax2 = plt.subplot(gs1[0, 1])
+x_lim_temp = [-18, 170]
+plot_violin(ax2, 
+            amp_change_tele_t_126, amp_change_tele_t_245, amp_change_tele_t_370, amp_change_tele_t_585, 
+            "Teleconnection with temperature",
+            "Change in tau_T strength(%)", x_lim_temp)
+
+ax3 = plt.subplot(gs1[0, 2])
+x_lim_precip = [-28, 64]
+plot_violin(ax3, 
+            amp_change_tele_p_126, amp_change_tele_p_245, amp_change_tele_p_370, amp_change_tele_p_585, 
+            "Teleconnection with precipitation",
+            "Change in tau_P strength (%)", x_lim_precip)
+
+plt.subplots_adjust(top=0.85, wspace=0.2)
+plt.savefig("../Fig/Fig4abc_CMIP_amplitude_change_violin.pdf")
+plt.show()
+
+```
+
+```{r Figure 4de}
+data <- read.csv("Data/7.SSP/Figure4def/CMIP_dengue_change.csv")
+data$ensemble <- as.factor(data$ensemble)
+data$ssp <- as.factor(data$ssp)
+
+library(ggplot2)
+library(gridExtra)
+custom_colors <- c("126" = "#89e8b5","245" = "#db8659","370" = "#bb2744", "585" = "#3d1bd1")
+p1 <- ggplot(data, aes(x = enso_change*100, y = delta_case*100, color = ssp)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey") + 
+  geom_point(size = 3, alpha = 0.5) + 
+  geom_smooth(method = "lm", se = TRUE, alpha = 0.2, color = "black", fill = "black") + 
+  labs(title = "Effect of ENSO amplitude", x = "% change in ENSO amplitude", y = "% change in dengue via local climate",
+       color = "SSP", fill = "SSP") + 
+  ylim(-20, 210) +
+  scale_color_manual(values = custom_colors) + 
+  scale_fill_manual(values = custom_colors) +  
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5), 
+    legend.position = c(0.1, 0.8), 
+    panel.background = element_blank(), 
+    panel.grid = element_blank(), 
+    panel.border = element_rect(color = "black", fill = NA, size = 1),
+    axis.ticks = element_line(color = "black") 
+  ) 
+model1 <- lm(delta_case ~ enso_change, data = data)
+slope1 <- coef(model1)[2]
+p_value1 <- summary(model1)$coefficients[2, 4]
+p1 <- p1 + annotate("text", x = Inf, y = Inf, 
+                    label = paste("Slope:", round(slope1, 3), "\nP-value:", round(p_value1, 5)), 
+                    hjust = 1.1, vjust = 1.5, color = "black", size = 4, 
+                    parse = FALSE)
+
+p2 <- ggplot(data, aes(x = tele_change*100, y = delta_case*100, color = ssp)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey") + 
+  geom_point(size = 3, alpha = 0.5) + 
+  geom_smooth(method = "lm", se = TRUE, alpha = 0.2, color = "black", fill = "black") + 
+  labs(title = "Effect of teleconnections",x = "% change in teleconnections with temperature",y = "% change in dengue via local climate",
+       color = "SSP", model="") +
+  ylim(-20, 210)+
+  scale_color_manual(values = custom_colors) +  
+  scale_fill_manual(values = custom_colors) +  
+  theme_minimal() + 
+  theme(
+    plot.title = element_text(hjust = 0.5), 
+    legend.position = c(0.1, 0.8), 
+    panel.background = element_blank(), 
+    panel.grid = element_blank(), 
+    panel.border = element_rect(color = "black", fill = NA, size = 1),
+    axis.ticks = element_line(color = "black") 
+  ) 
+model2 <- lm(delta_case ~ tele_change, data = data)
+slope2 <- coef(model2)[2]
+p_value2 <- summary(model2)$coefficients[2, 4]
+p2 <- p2 + annotate("text", x = Inf, y = Inf, 
+                    label = paste("Slope:", round(slope2, 3), "\nP-value:", round(p_value2, 5)), 
+                    hjust = 1.1, vjust = 1.5, color = "black", size = 4, 
+                    parse = FALSE)
+
+
+pdf("Figure 4de.pdf", width = 8, height = 5)
+grid.arrange(p1, p2, nrow = 1,widths = c(1,1))
+dev.off()
+
+```
+
+```{r Figure 4f}
+### plot % change in dengue due to EI Nino and La Nina under 4 SSPs
+library(ggplot2)
+library(readxl)
+library(dplyr)
+library(tidyr)
+
+summary <- read.csv("Data/7.SSP/Figure4def/summary_enso_events.csv")
+
+## plot Fig.4f
+summary$variable <- factor(summary$variable, levels =  c("ei_126","la_126","ei_245","la_245","ei_370","la_370","ei_585","la_585"))
+pdf("Figure 4f.pdf", width = 5, height = 5)
+ggplot(summary, aes(y = mean, x = variable, color = ENSO)) +
+  geom_linerange(aes(ymin = ci_low, ymax = ci_high),size = 1, alpha=0.5) +
+  scale_color_manual(values = c("#e78ac3", "#8da0cb")) +
+  geom_point(size = 3) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank(),
+        axis.line.x.bottom = element_line(size = .2),
+        axis.line.y.left = element_line(size = .2),
+        panel.background = element_rect(fill = "transparent")) +
+  geom_hline(yintercept = 0, linetype = "dashed")
+dev.off()
+```
+
+
