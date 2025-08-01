@@ -1,6 +1,6 @@
-# Rising dengue risk with intensified climate modes and teleconnections under greenhouse warming
+# Rising dengue risk with increasing ENSO amplitude and teleconnections from 1980 to 2024
 
-Replication code and data for "Rising dengue risk with intensified climate modes and teleconnections under greenhouse warming" 
+Replication code and data for "Rising dengue risk with increasing ENSO amplitude and teleconnections from 1980 to 2024" 
 
 If you have questions or suggestions, contact the corresponding author.
 
